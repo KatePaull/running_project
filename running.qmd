@@ -1,0 +1,510 @@
+---
+title: "Seattle Half Marathon Training: November 26, 2023"
+subtitle: "The purpose of this code was to analyze running trends in preparation for a half-marathon. Note that I was unable to run the half-marathon due to an injury."
+format: html
+editor: visual
+title-block-banner: "orange"
+---
+
+```{r}
+#| code-fold: true
+#| label: Web Scrape - Quotes
+
+#chunk purpose: web scrape a running inspirational quote page and randomly select one quote to display in the half marathon Quarto file
+
+pacman::p_load(chron, ggrepel, ggwordcloud, gridExtra, kableExtra, knitr, rvest, tidyverse)
+
+inspiration_html <- read_html("https://www.runnersathletics.com/blogs/news/270-motivational-inspirational-and-funny-running-quotes?kw=&campid=20397210215&adgroup=&extension=&creative=&tw_source=google&tw_adid=&tw_campaign=20397210215&gclid=EAIaIQobChMIodi2ha_fgAMVIiCtBh2UEQwyEAAYAyAAEgJ54fD_BwE")
+
+inspiration <- as.data.frame(inspiration_html %>%
+  html_elements("li") %>%
+  html_elements("span") %>%
+  html_text2()) %>% 
+  rename(quote = 1) %>% 
+  filter(str_detect(quote, " ")) %>% #remove non-quote lines
+  sample_n(1) #randomly select 1 quote to display each time rendered
+
+rm(inspiration_html)
+
+```
+
+*`r inspiration`*
+
+## **Training Schedule**
+
+```{r}
+#| code-fold: true
+#| label: Web Scrape - Training Schedule
+
+#chunk purpose: web scrape half marathon training schedule to know how far to run each day, make kable table to display schedule in Quarto
+
+training_plan_html <- read_html("https://www.halfmarathons.net/14-week-half-marathon-training-schedule/")
+
+training_schedule <- as.data.frame(
+  training_plan_html %>% 
+  html_elements(".table-responsive") %>%
+  html_table()
+) %>% 
+  select(9:16) #1:8 not needed, related to alternative training schedule
+
+#need to remove text from vars, pivot longer for tidy format
+
+#rename vars: remove ".1" and conform to lower case
+names(training_schedule) <- tolower(gsub(pattern = ".1", replacement = "", x = names(training_schedule)))
+
+#remove text from variables and replace NA with 0 to indicate 0 miles to run that day
+parse <- function(x) (parse_number(x)) #remove text
+coal <- function(x) (coalesce(x, 0)) # NA -> 0
+
+training_schedule <- training_schedule %>%        
+  mutate_at(2:8, ~str_replace(., "off", "0") %>% 
+              parse %>% 
+              coalesce) %>% 
+  mutate(sun = round(sun, 0)) #round last entry, 13.1 miles, to 0 decimals for display preferences
+
+#duplicate data frame to have one in wide format for display and one long format for data analysis
+training_schedule_for_kable <- training_schedule %>%
+  rename_with(str_to_title)
+
+#pivot longer so all runs are in one column (elim cols for each weekday)
+#long format used to assign dates to each run; 1st date of each week will then be added to wide format for kable display
+training_schedule <- training_schedule %>%
+  pivot_longer(
+    cols = !week, 
+    names_to = "weekday", 
+    values_to = "distance"
+  )
+
+#Assign dates to each run for tracking
+start_date <- as.Date("2023/08/07") #1st day of training
+
+training_schedule_length <- as.numeric(nrow(training_schedule)) #number of days in training schedule
+
+training_schedule <- training_schedule %>% 
+  mutate(date = seq(start_date, by = "day", length.out = training_schedule_length)) %>% 
+  relocate(date, .before = week)
+
+#add week start date for display purposes
+training_schedule_week_start <- training_schedule %>%
+  select(week, date) %>% 
+  group_by(week) %>% 
+  slice_head() %>% 
+  rename_with(str_to_title) %>% #capitalize for left_join
+  ungroup()
+
+training_schedule_for_kable <- left_join(training_schedule_for_kable, training_schedule_week_start, by = "Week") %>% 
+  relocate(Date, .after = "Week")
+                     
+#generate kable schedule with strike-outs for weeks that have passed
+kable_training_schedule <- kable(training_schedule_for_kable, "html", col.names = c("Week Number", "Week of", "Mon Miles", "Tues Miles", "Weds Miles", "Thurs Miles", "Fri Miles", "Sat Miles", "Sun Miles")) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"), position = "left") 
+
+rm(training_plan_html, start_date)
+
+kable_training_schedule
+
+```
+
+## **Monthly Averages**
+
+```{r}
+#| code-fold: true
+#| label: Import and Tidy Fitbit Data, Generate Kable Summary Table
+
+#chunk purpose: import run data from Fitbit for data analytics
+
+runs_completed <- read_csv("./rundata.csv", show_col_types = FALSE)#Fitbit data on exercise this year
+
+#"Date" is chr type and has month, day, time but no year
+#"Run" and "Run Edit" are the only obs of interest within "Activities" var
+#need to eliminate commas and chars in steps, cals, distance; make numeric
+
+runs_completed <- janitor::clean_names(runs_completed) #lower case var names
+
+runs_completed <- runs_completed %>%
+  filter(activity == "Run" | activity == "Run Edit") %>% #remove hikes, bikes, etc.
+  select(-activity) %>% #column no longer needed
+  filter(calories != "0 cals") %>% #remove tracking errors
+  separate_wider_delim(date, ", ", names = c("month_day", "time")) %>% #split date/time
+  mutate(year = as.character(2023), #year not included in source data
+         datetime = strptime(paste(month_day, year, time, sep = " "), format = "%b %e %Y %I:%M %p", tz = "GMT")
+         ) #generate dttm format
+
+#remove unnecessary variables, reorder cols
+runs_completed <- runs_completed %>%
+  select(-month_day, -year, -time) %>%
+  relocate(datetime)
+
+runs_completed <- runs_completed %>% mutate_at(c("calories", "distance", "steps"), parse) %>% #remove characters to generate numeric types
+  rename(distance_miles = distance)
+
+#fix duration format: runs > 1h are HH:MM:SS format but runs < 1h are MM:SS:00 format -> make all obs HH:MM:SS by modifying runs <1h: trim right ":00" then add left "00:" to indicate 0 hours
+
+#first make duration char type temporarily for str_sub trim and paste, then convert back to time format at end
+#locate obs ending in :00, which are runs under 1h -> select characters 1 - 5, which consist of MM:SS and paste HH of "00:" to left side for HH:MM:SS format
+
+runs_completed <- runs_completed %>%
+  mutate(
+    duration_time = as.times(if_else(
+      str_detect(as.character(duration), ":00$"),
+      paste("00:", str_sub(as.character(duration), 1, 5), sep = ""),
+      as.character(duration)))) %>% #leave runs > 1h alone
+  select(-duration)
+
+#keep duration_time as "time" class for future averages calcs, but also make duration_period as period class so format is proper for ggplots
+runs_completed <- runs_completed %>% 
+   mutate(
+     duration_period  =  period(
+       hours   = str_sub(duration_time, 1, 2),
+       minutes = str_sub(duration_time, 4, 5),
+       seconds = str_sub(duration_time, 7, 8)),
+     avg_time = as.period(as.duration(duration_period)/distance_miles)) %>%
+  relocate(duration_period, avg_time, .after = duration_time)
+
+#make month factor and make variables of interest for subsequent ggplots
+runs_completed <- runs_completed %>%
+  mutate(month = factor(month.abb[month(datetime)], levels = month.abb)) %>%
+  relocate(month, .after = datetime) %>%
+  group_by(month) %>%
+ mutate(
+  avg_mile = duration_time/distance_miles,
+  monthly_avg_mile = mean(duration_time/distance_miles)
+  ) %>% 
+  ungroup()
+
+#calculate summary stats for meaningful variables and display in table
+stats_for_kable <- runs_completed %>% 
+  select(month, distance_miles, monthly_avg_mile) %>% 
+  group_by(month) %>% 
+  summarise_all(~mean(.x, na.rm = TRUE)) %>% 
+  mutate(distance_miles = round(distance_miles, 2)) %>% 
+  ungroup()
+
+kable_stats <- kable(stats_for_kable, "html",  col.names = c("Month", "Miles", "Mile Time")) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+kable_stats
+
+```
+
+## **Trends**
+
+```{r}
+#| code-fold: true
+#| label: GGPLOTS Section 1 - Barplots
+
+#Make barplot of runs per month
+barplot_runs_per_month <- runs_completed %>%
+  group_by(month) %>% 
+  summarize(monthly_runs = n()) %>%
+  ggplot(aes(month, monthly_runs, fill = month)) +
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  scale_fill_brewer(palette = "Paired") +
+  labs(title = "Runs per Month", x = "Month", y = "Number of Runs") +
+  theme(
+    plot.title = element_text(size = 20, hjust = 0.5),
+    axis.title = element_text(size = 17),
+    axis.text = element_text(size = 15, color = "black")
+  ) + 
+  guides(fill = "none") +
+  geom_text(aes(label = monthly_runs),
+    size = 4, hjust = "center", vjust = "bottom", nudge_y = 0.5
+  )
+
+#Make barplot of run distance by month
+barplot_distance_per_month <- runs_completed %>%
+  group_by(month) %>% 
+  summarize(monthly_dist = sum(distance_miles)) %>%
+  ggplot(aes(month, monthly_dist, fill = month)) +
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  scale_fill_brewer(palette = "Paired") +
+  labs(title = "Total Miles per Month",
+       x = "Month",
+       y = "Total Miles Run")  +
+  theme(
+    plot.title = element_text(size = 20, hjust = 0.5),
+    axis.title = element_text(size = 17),
+    axis.text = element_text(size = 15, color = "black")
+  ) +
+  guides(fill = "none") +
+  geom_text(
+    aes(label = monthly_dist),
+    size = 4,
+    hjust = "center",
+    vjust = "bottom",
+    nudge_y = 1
+  )
+
+```
+
+::: panel-tabset
+## Runs per Month
+
+```{r}
+#| echo: false
+#| label: tabset 1a - runs/mo barplot
+
+barplot_runs_per_month
+
+```
+
+## Distance per Month
+
+```{r}
+#| echo: false
+#| label: tabset 1b - distance/mo barplot
+
+barplot_distance_per_month
+
+```
+:::
+
+```{r}
+#| code-fold: true
+#| label: GGPLOTS Section 2 - Boxplots
+
+boxplot_duration <- ggplot(runs_completed, aes(month, duration_period, color = month)) +
+  geom_boxplot() +
+  guides(color = "none") +
+  theme_classic() +
+  scale_color_brewer(palette = "Paired") +
+  scale_y_time() +
+  labs(
+    title = "Duration by Month",
+    x = NULL,
+    y = "Run Duration \n(HH:MM:SS)") +
+  theme(
+    plot.title = element_text(size = 20, hjust = 0.5),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+boxplot_distance <- ggplot(runs_completed, aes(month, distance_miles, color = month)) +
+  geom_boxplot() +
+  guides(color = "none") +
+  theme_classic() +
+  scale_color_brewer(palette = "Paired") +
+  labs(
+    title = "Individual Run Distances by Month",
+    x = NULL,
+    y = "\n \n \nRun Distance (Miles) ") +
+  theme(
+    plot.title = element_text(size = 20, hjust = 0.5),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+```
+
+::: panel-tabset
+## Run Distance by Month
+
+```{r}
+#| echo: false
+#| label: tabset 2a - distance boxplot
+
+boxplot_distance
+
+```
+
+## Run Durations by Month
+
+```{r}
+#| echo: false
+#| label: tabset 2b - duration boxplot
+
+boxplot_duration
+
+```
+:::
+
+```{r}
+#| code-fold: true
+#| label: GGPLOTS Section 3 - Facets
+
+#chunk purpose: generate geom_point & geom_line of mile time (y) across 2023, faceted by run distance. Allows viewer to see if mile times for each run distance have improved throughout year. Average mile times should be different for long vs. short runs due to different pacing.
+
+#split data into 4 groups based on run distances (1-3, 4-6, 7-9, 10+ miles) for facet plots. Each set will show 3 faceted plots, 4 sets total generated.
+
+#need 2 data subsets for each of the 4 groups: one for geom_points and one for geom_lines (separate geom_line subsets are needed b/c some distances have only been run once and no line can be drawn between points, returns error)
+
+#first generate discrete distances for subsequent distance groupings
+runs_completed <- runs_completed %>% 
+  mutate(mile_rounded = round(distance_miles, 0))
+
+#gen var that labels 1st facet (1 mile) "mile" and labels remaining facets of miles 2+ with "miles"
+runs_completed <- runs_completed %>% 
+  mutate(mile_rounded_label = if_else(
+    mile_rounded == 1, paste(mile_rounded, "Mile", sep = " "),
+                       paste(mile_rounded, "Miles", sep = " "))) 
+
+#create data subset that excludes discrete run distances that have only occurred once. Subset will be used for geom_lines, which require at least 2 data points
+runs_completed_multiple_miles_subset <- runs_completed %>%
+  group_by(mile_rounded) %>% mutate(n = n()) %>% 
+  filter(n > 1)
+
+#split both datasets into 4 groups based on discrete run distances (1-3, 4-6, 7-9, 10+
+runs_completed_sub_1a <- runs_completed %>% 
+  filter(mile_rounded <= 3)
+
+runs_completed_sub_1b <- runs_completed_multiple_miles_subset %>% 
+  filter(mile_rounded <= 3)
+
+runs_completed_sub_2a <- runs_completed %>% 
+  filter(mile_rounded > 3 & mile_rounded <= 6)
+
+runs_completed_sub_2b <- runs_completed_multiple_miles_subset %>% 
+  filter(mile_rounded > 3 & mile_rounded <= 6)
+
+runs_completed_sub_3a <- runs_completed %>% 
+  filter(mile_rounded > 6 & mile_rounded <= 9)
+
+runs_completed_sub_3b <- runs_completed_multiple_miles_subset %>% 
+  filter(mile_rounded > 6 & mile_rounded <= 9)
+
+runs_completed_sub_4a <- runs_completed %>% 
+  filter(mile_rounded > 9)
+
+runs_completed_sub_4b <- runs_completed_multiple_miles_subset %>% 
+  filter(mile_rounded > 9)
+
+#split "Paired" palette into 4 subsections for 4 gg subplots
+sub_1_palette <- c("#A6CEE3", "#1F78B4", "#B2DF8A")
+sub_2_palette <- c("#33A02C", "#FB9A99", "#E31A1C")
+sub_3_palette <- c("#FDBF6F", "#FF7F00", "#CAB2D6")
+sub_4_palette <- c("#6A3D9A", "#FFFF99", "#B15928")
+
+#write ggplot function that generates a set of ggplots for each of the 4 groups
+gg_facet_repeat <- function(sub_a, sub_b, palette) {
+{{ sub_a }} %>% 
+  ggplot(aes(date(datetime), avg_time, color = factor(mile_rounded_label))) +
+  facet_wrap(~mile_rounded_label) +
+  geom_point() +
+  geom_line(data = {{ sub_b }}, aes(date(datetime), avg_time)) +
+  scale_y_time(labels = waiver()) +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  theme_classic() +
+  scale_color_manual(values = {{ palette }}) +
+  labs(
+    title = "Change in Average Pace Throughout 2023 \n by Run Distance",
+    subtitle = "\n Paces vary based on planned running distance",
+    x = NULL,
+    y = "Average Mile Time") +
+  theme(
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 10, color = "black"),
+    legend.position = "bottom",
+    legend.justification = "left",
+    axis.text.x = element_text(angle = 90, vjust = 0.5),
+    panel.grid.major.y = element_line(linewidth = 0.2, linetype = 2, color = "gray")
+  ) +
+  guides(color = guide_legend(title = "Miles Run"))
+}
+
+#facet miles 1-3
+facet_1 <- gg_facet_repeat(runs_completed_sub_1a, runs_completed_sub_1b, sub_1_palette)
+
+#facet miles 4-6
+facet_2 <- gg_facet_repeat(runs_completed_sub_2a, runs_completed_sub_2b, sub_2_palette)
+
+#facet miles 7-9
+facet_3 <- gg_facet_repeat(runs_completed_sub_3a, runs_completed_sub_3b, sub_3_palette)
+
+#facet miles 10+
+facet_4 <- gg_facet_repeat(runs_completed_sub_4a, runs_completed_sub_4b, sub_4_palette)
+
+rm(gg_facet_repeat, sub_1_palette, sub_2_palette, sub_3_palette, sub_4_palette, runs_completed_sub_1a, runs_completed_sub_1b, runs_completed_sub_2a, runs_completed_sub_2b, runs_completed_sub_3a, runs_completed_sub_3b, runs_completed_sub_4a, runs_completed_sub_4b, runs_completed_multiple_miles_subset)
+
+```
+
+::: panel-tabset
+## 1-3 Mile Pace Trends in 2023
+
+```{r}
+#| echo: false
+#| label: tabset 3a - facet plot miles 1-3
+
+facet_1
+
+```
+
+## 4-6 Mile Pace Trends in 2023
+
+```{r}
+#| echo: false
+#| label: tabset 3b - facet plot miles 4-6
+
+facet_2
+
+```
+
+## 7-9 Mile Pace Trends in 2023
+
+```{r}
+#| echo: false
+#| label: tabset 3c - facet plot miles 7-9
+
+facet_3
+
+```
+:::
+
+```{r}
+#| code-fold: true
+#| label: GGPLOTS Section 4 - Scatter Plot
+
+#make scatterplot of run distance over time, with a unique plot point for the last run
+last_run_point <- runs_completed %>% 
+  slice_head()
+  
+scatter_plot <- runs_completed %>%
+  ggplot(aes(date(datetime), distance_miles)) +
+  geom_jitter(aes(color = distance_miles, alpha = 0.5), shape = 17) +
+  geom_point(
+    data = last_run_point,
+    color = "black",
+    fill = "black",
+    size = 3,
+    shape = 17
+  ) +
+  geom_text_repel(data = last_run_point, aes(label = "Last Run"), vjust = -4) +
+      theme_classic() +
+      theme(
+        plot.title = element_text(size = 20, hjust = 0.5),
+        axis.title = element_text(size = 17),
+        axis.text = element_text(size = 15, color = "black")
+      ) +
+      labs(title = "Run Distance Over Time\n", x = "Months", y = "Miles per Run") +
+      scale_color_gradient(
+        low = "orange",
+        high = "red",
+        name = "Distance (Miles)"
+      ) +
+      scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+      guides(alpha = "none")
+
+scatter_plot
+
+```
+
+## **Run Destinations Word Cloud**
+
+```{r}
+#| code-fold: true
+#| label: GGPLOTS Section 5 - Word Cloud
+word_cloud <- runs_completed %>%
+  select(destination) %>% 
+  group_by(destination) %>% 
+  summarize(n = n()) %>% 
+  ggplot(aes(label = destination, color = destination, size = n, shape = "circle")) +
+  geom_text_wordcloud(shape = "diamond") +
+  scale_size_area(max_size = 16) +
+  theme_void()
+
+word_cloud
+
+```
