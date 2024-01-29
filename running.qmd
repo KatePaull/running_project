@@ -1,6 +1,6 @@
 ---
 title: "Seattle Half Marathon Training: November 26, 2023"
-subtitle: "The purpose of this code was to analyze running trends in preparation for a half-marathon, and to create a training schedule to follow. It also serves as a fun way to showcase my data wrangling and data visualization skillset"
+subtitle: "The purpose of this code was to analyze running trends in preparation for a half-marathon, and to create a training schedule to follow. It also serves as a fun way to showcase my data wrangling and data visualization skillset."
 format: html
 editor: visual
 title-block-banner: "orange"
